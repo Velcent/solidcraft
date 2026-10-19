@@ -20,7 +20,7 @@ env:
 
 jobs:
   build:
-    name: Build Windows x64
+    name: Build Windows x64 & MSI
     runs-on: windows-latest
     steps:
       - name: Checkout repository
@@ -32,6 +32,15 @@ jobs:
       - name: Cache Cargo registry and build
         uses: Swatinem/rust-cache@v2
 
+      - name: Install WiX Toolset v5
+        shell: pwsh
+        run: |
+          # Install WiX Toolset v5 (diperlukan untuk perintah 'wix build')
+          winget install WiXToolset.WixToolset --accept-package-agreements --accept-source-agreements
+          # Refresh PATH agar perintah 'wix' dapat dikenali di shell yang sama
+          $env:PATH = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+          wix --version
+
       - name: Build SolidCraft (Static CRT)
         shell: pwsh
         run: |
@@ -41,45 +50,88 @@ jobs:
           # Build aplikasi desktop dan CLI
           cargo build --release --locked -p solidcraft -p solidcraft-cli --target x86_64-pc-windows-msvc
 
-      - name: Prepare Release Directory
+      - name: Prepare Staging Directory & Build MSI
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path release
+          # 1. Ekstrak versi dari Cargo.toml (mirip dengan package.ps1 asli)
+          $CargoToml = Get-Content "Cargo.toml" -Raw
+          if ($CargoToml -match '(?m)^\s*version\s*=\s*"([^"]+)"') {
+              $Version = $Matches[1]
+          } else {
+              $Version = "${{ github.ref_name }}".TrimStart('v')
+          }
+          $MsiVersion = $Version.Split('-')[0] # MSI hanya menerima angka (major.minor.build)
           
-          # Salin biner utama
-          Copy-Item "target\x86_64-pc-windows-msvc\release\solidcraft.exe" -Destination "release\"
-          Copy-Item "target\x86_64-pc-windows-msvc\release\solidcraft-cli.exe" -Destination "release\"
+          # 2. Tentukan path
+          $Target = "x86_64-pc-windows-msvc"
+          $BinDir = "target\$Target\release"
+          $Stage = "target\windows-package\x64"
+          $Dist = "dist"
           
-          # Salin alias kompatibilitas lama (jika ada)
-          if (Test-Path "target\x86_64-pc-windows-msvc\release\solvecraft-cli.exe") {
-            Copy-Item "target\x86_64-pc-windows-msvc\release\solvecraft-cli.exe" -Destination "release\"
+          New-Item -ItemType Directory -Force -Path $Stage, $Dist | Out-Null
+          
+          # 3. Salin biner ke folder staging
+          Copy-Item "$BinDir\solidcraft.exe", "$BinDir\solidcraft-cli.exe" $Stage
+          if (Test-Path "$BinDir\solvecraft-cli.exe") { 
+              Copy-Item "$BinDir\solvecraft-cli.exe" $Stage 
           }
           
-          # Salin lisensi dan dokumentasi
-          $files = @("LICENSE-MIT", "LICENSE-APACHE", "NOTICE", "THIRD-PARTY-LICENSES.txt", "README.md")
-          foreach ($f in $files) {
-            if (Test-Path $f) { Copy-Item $f -Destination "release\" }
+          # 4. Salin file lisensi dan dokumentasi
+          foreach ($f in @("LICENSE-MIT", "LICENSE-APACHE", "NOTICE", "THIRD-PARTY-LICENSES.txt", "README.md")) {
+              if (Test-Path $f) { Copy-Item $f $Stage }
           }
+          
+          # 5. Cari path ikon (fallback jika path eksak berubah)
+          $IconPath = "assets/icons/app/windows/exports/solidcraft.ico"
+          if (-not (Test-Path $IconPath)) {
+              $FoundIcon = Get-ChildItem -Recurse -Filter "solidcraft.ico" -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($FoundIcon) { $IconPath = $FoundIcon.FullName }
+          }
+          
+          Write-Host "Building MSI for Version: $Version (MSI Version: $MsiVersion)"
+          Write-Host "Using Icon: $IconPath"
+          
+          # 6. Jalankan perintah WiX Build (persis seperti di package.ps1)
+          wix build assets/platforms/windows/solidcraft.wxs -arch x64 `
+            -ext WixToolset.UI.wixext -ext WixToolset.Util.wixext `
+            -culture en-US -loc assets/platforms/windows/solidcraft.en-us.wxl `
+            -d "Version=$MsiVersion" -d "DisplayVersion=$Version" `
+            -d "BinDir=$Stage" -d "IconPath=$IconPath" `
+            -o "$Dist\solidcraft-$Version-windows-x64.msi"
 
-      - name: Compress Portable Zip
+      - name: Prepare Portable Zip & Standalone Exe
         shell: pwsh
         run: |
-          # Buat arsip portable yang berisi semua biner dan lisensi
-          Compress-Archive -Path "release\*" -DestinationPath "solidcraft-windows-x64-portable.zip"
-
-      - name: Prepare Standalone Executable
-        shell: pwsh
-        run: |
-          # Salin executable utama sebagai file unduhan tunggal yang mudah digunakan
-          Copy-Item "release\solidcraft.exe" -Destination "SolidCraft-windows-x64.exe"
+          $Dist = "dist"
+          $Stage = "target\windows-package\x64"
+          
+          # 1. Ekstrak versi lagi untuk penamaan file (atau bisa pakai variabel yang sudah ada jika di-scope dengan benar)
+          $CargoToml = Get-Content "Cargo.toml" -Raw
+          if ($CargoToml -match '(?m)^\s*version\s*=\s*"([^"]+)"') {
+              $Version = $Matches[1]
+          } else {
+              $Version = "${{ github.ref_name }}".TrimStart('v')
+          }
+          
+          # 2. Buat arsip portable DENGAN VERSI di nama file
+          $PortableDir = "target\windows-package\portable"
+          New-Item -ItemType Directory -Force -Path $PortableDir | Out-Null
+          Copy-Item "$Stage\*.exe" $PortableDir
+          Copy-Item "$Stage\*.md", "$Stage\*.txt" $PortableDir -ErrorAction SilentlyContinue
+          
+          Compress-Archive -Path "$PortableDir\*" -DestinationPath "$Dist\solidcraft-$Version-windows-x64-portable.zip"
+          
+          # 3. Salin executable utama sebagai unduhan tunggal DENGAN VERSI di nama file
+          Copy-Item "$Stage\solidcraft.exe" -Destination "$Dist\SolidCraft-$Version-windows-x64.exe"
 
       - name: Upload Release Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: SolidCraft-windows-x64
+          name: SolidCraft-windows-x64-release
           path: |
-            solidcraft-windows-x64-portable.zip
-            SolidCraft-windows-x64.exe
+            dist/solidcraft-*-windows-x64.msi
+            dist/solidcraft-*-windows-x64-portable.zip
+            dist/SolidCraft-*-windows-x64.exe
 
   publish:
     name: Publish Release
@@ -98,7 +150,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
-          name: Release ${{ inputs.tag || github.ref_name }}
+          name: SolidCraft ${{ inputs.tag || github.ref_name }}
           draft: true
           generate_release_notes: true
           files: dist/*
